@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -91,21 +92,35 @@ REQUIRED_COLUMNS = [
     "Period",
 ]
 
+# When a file named this lives next to app.py, it's auto-loaded on startup so
+# a shared dashboard URL shows data immediately with no upload step — the
+# admin refreshes it by uploading a new report (or replacing this file).
+DATA_XLSX_NAME = "data.xlsx"
+DATA_XLSX_PATH = Path(__file__).resolve().parent / DATA_XLSX_NAME
+
 # Substring keywords used to auto-detect each required field from whatever
 # headers a given export happens to use. Order within each list is priority
 # (tried first-to-last); fields are matched in keyword "rounds" (every
 # field's 1st keyword, then every field's 2nd, ...) so a field with a single
 # specific keyword (e.g. Model(s) -> "model") claims its column before a
 # generic keyword from another field (e.g. User -> "name") can steal it.
+#
+# Total Tokens is handled separately (see detect_total_tokens) since some
+# exports split it into prompt/completion (or input/output) token columns
+# that need to be summed rather than matched 1:1.
 FIELD_KEYWORDS = {
     "User": ["user", "email", "name"],
     "Product": ["product"],
     "Model(s)": ["model"],
     "Requests": ["request"],
-    "Total Tokens": ["token"],
     "Net Spend (USD)": ["spend", "cost", "usd", "amount"],
-    "Period": ["period", "date", "time"],
+    "Period": ["period", "month", "date", "time"],
 }
+
+# Substrings used to find the two halves of a split token count. A column
+# must contain "token" AND one of these to count as that half.
+PROMPT_TOKEN_HINTS = ("prompt", "input")
+COMPLETION_TOKEN_HINTS = ("completion", "output")
 
 MONTH_NAMES = (
     "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|"
@@ -132,6 +147,20 @@ def format_tokens(n: float) -> str:
 
 def format_currency(n: float) -> str:
     return f"${n:,.2f}"
+
+
+METHOD_LABELS = {
+    "auto": "auto-detected",
+    "auto_sum": "auto-detected, summed",
+    "manual": "manually selected",
+}
+
+
+def describe_mapping_source(source) -> str:
+    """'col' -> "'col'"; [col1, col2] -> "'col1' + 'col2'" (summed fields)."""
+    if isinstance(source, (list, tuple)):
+        return " + ".join(f"'{c}'" for c in source)
+    return f"'{source}'"
 
 
 def auto_match_columns(columns: list) -> tuple:
@@ -170,6 +199,72 @@ def auto_match_columns(columns: list) -> tuple:
                 candidates[field] = matches
                 resolved.add(field)
     return mapping, candidates
+
+
+def detect_total_tokens(columns: list) -> dict:
+    """Resolve the Total Tokens field, which may be one combined column or
+    two halves (e.g. total_prompt_tokens + total_completion_tokens) that
+    need to be summed.
+
+    Returns {"mode": "sum"|"single"|"ambiguous"|"none", "value": ..., "candidates": [...]}
+    - "sum": value is [prompt_col, completion_col] — add them together.
+    - "single": value is the one column that already holds a combined total.
+    - "ambiguous": several "*token*" columns exist with no clear prompt/
+      completion pairing (e.g. separate cache-read/cache-write buckets) —
+      value is None, candidates lists them for a manual pick.
+    - "none": no token-ish column found at all.
+    """
+    cols = list(columns)
+
+    def find_half(hints):
+        for col in cols:
+            key = str(col).strip().lower()
+            if "token" in key and any(h in key for h in hints):
+                return col
+        return None
+
+    prompt_col = find_half(PROMPT_TOKEN_HINTS)
+    completion_col = find_half(COMPLETION_TOKEN_HINTS)
+    if prompt_col and completion_col and prompt_col != completion_col:
+        return {"mode": "sum", "value": [prompt_col, completion_col], "candidates": []}
+
+    token_cols = [c for c in cols if "token" in str(c).strip().lower()]
+    if len(token_cols) == 1:
+        return {"mode": "single", "value": token_cols[0], "candidates": []}
+    if len(token_cols) > 1:
+        return {"mode": "ambiguous", "value": None, "candidates": token_cols}
+    return {"mode": "none", "value": None, "candidates": []}
+
+
+def resolve_column_mapping(columns: list) -> dict:
+    """Full auto-mapping pass for every required field, Total Tokens included.
+
+    Returns {field: {"status": "auto"|"auto_sum"|"ambiguous"|"unmatched",
+    "value": column_or_[col1,col2]_or_None, "candidates": [...]}}.
+    """
+    simple_map, simple_ambiguous = auto_match_columns(columns)
+    resolved = {}
+    for field in FIELD_KEYWORDS:
+        if simple_map[field] is not None:
+            resolved[field] = {"status": "auto", "value": simple_map[field], "candidates": []}
+        elif simple_ambiguous[field]:
+            resolved[field] = {"status": "ambiguous", "value": None, "candidates": simple_ambiguous[field]}
+        else:
+            resolved[field] = {"status": "unmatched", "value": None, "candidates": []}
+
+    # Total Tokens is detected over whatever columns the simple fields didn't
+    # already claim, so e.g. a "user_token_count" column can't be claimed by
+    # both User and Total Tokens.
+    claimed = {c for c in simple_map.values() if c}
+    remaining = [c for c in columns if c not in claimed]
+    token_info = detect_total_tokens(remaining)
+    status_map = {"sum": "auto_sum", "single": "auto", "ambiguous": "ambiguous", "none": "unmatched"}
+    resolved["Total Tokens"] = {
+        "status": status_map[token_info["mode"]],
+        "value": token_info["value"],
+        "candidates": token_info["candidates"],
+    }
+    return resolved
 
 
 def detect_date_series(raw_df: pd.DataFrame):
@@ -222,24 +317,85 @@ def read_and_validate_file(uploaded_file) -> tuple:
     return raw, None
 
 
+def read_local_data_file(path: Path) -> tuple:
+    """Same as read_and_validate_file, but for the auto-loaded data.xlsx on disk."""
+    try:
+        raw = read_excel_bytes(path.read_bytes())
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Could not read '{path.name}': {exc}"
+    return raw, None
+
+
+def format_period_column(raw_series: pd.Series) -> pd.Series:
+    """Render Period as 'YYYY-MM-DD' when the source is a real calendar date
+    (e.g. a "Month" column), otherwise keep it as a plain string. Parsing is
+    constrained to that exact format for string input so a bare billing
+    period number like "1" or "2" fails to parse (and is kept as-is) instead
+    of pandas silently reinterpreting it as a nanosecond-epoch timestamp."""
+    if pd.api.types.is_datetime64_any_dtype(raw_series):
+        return raw_series.dt.strftime("%Y-%m-%d")
+    try:
+        parsed = pd.to_datetime(raw_series, format="%Y-%m-%d", errors="coerce")
+    except (ValueError, TypeError):
+        parsed = pd.Series([pd.NaT] * len(raw_series), index=raw_series.index)
+    if len(raw_series) and parsed.notna().all():
+        return parsed.dt.strftime("%Y-%m-%d")
+    return raw_series.astype(str).str.strip()
+
+
 def finalize_mapped_df(raw_df: pd.DataFrame, mapping: dict, filename: str) -> pd.DataFrame:
-    """Apply a confirmed field->source-column mapping and coerce types."""
+    """Apply a confirmed field->source-column mapping and coerce types.
+
+    `mapping["Total Tokens"]` may be a single source-column name, or a
+    [prompt_col, completion_col] pair to sum.
+    """
     date_series = detect_date_series(raw_df)
 
-    rename_map = {src: field for field, src in mapping.items() if src}
+    tokens_spec = mapping.get("Total Tokens")
+    simple_mapping = {field: src for field, src in mapping.items() if field != "Total Tokens"}
+    rename_map = {src: field for field, src in simple_mapping.items() if src}
     df = raw_df.rename(columns=rename_map)
 
+    if isinstance(tokens_spec, (list, tuple)):
+        prompt_col, completion_col = tokens_spec
+        df["Total Tokens"] = (
+            pd.to_numeric(raw_df[prompt_col], errors="coerce").fillna(0)
+            + pd.to_numeric(raw_df[completion_col], errors="coerce").fillna(0)
+        )
+    else:
+        df["Total Tokens"] = pd.to_numeric(raw_df[tokens_spec], errors="coerce").fillna(0)
+
     df["Requests"] = pd.to_numeric(df["Requests"], errors="coerce").fillna(0)
-    df["Total Tokens"] = pd.to_numeric(df["Total Tokens"], errors="coerce").fillna(0)
     df["Net Spend (USD)"] = pd.to_numeric(df["Net Spend (USD)"], errors="coerce").fillna(0)
     df["User"] = df["User"].astype(str).str.strip()
     df["Product"] = df["Product"].astype(str).str.strip()
     df["Model(s)"] = df["Model(s)"].astype(str).str.strip()
-    df["Period"] = df["Period"].astype(str).str.strip()
+    df["Period"] = format_period_column(df["Period"])
     df["Source File"] = filename
     df["Date"] = date_series if date_series is not None else pd.NaT
 
     return df
+
+
+def commit_file_mapping(name: str, raw_df: pd.DataFrame, final_map: dict, method: dict, fields: list) -> str:
+    """Finalize a confirmed (or fully auto-resolved) mapping, store it in
+    session state, and return a human-readable summary of how each field
+    was mapped."""
+    finalized = finalize_mapped_df(raw_df, final_map, name)
+    st.session_state.raw_frames[name] = finalized
+    st.session_state.column_mappings[name] = {field: (final_map[field], method[field]) for field in fields}
+    del st.session_state.pending_raw[name]
+
+    guessed = guess_date_from_filename(name)
+    if guessed is None and finalized["Date"].notna().any():
+        guessed = finalized["Date"].dropna().dt.date.min()
+    st.session_state.file_dates[name] = guessed
+
+    summary = "\n".join(
+        f"- {field} ← {describe_mapping_source(final_map[field])} ({METHOD_LABELS[method[field]]})"
+        for field in fields
+    )
+    return f"Loaded '{name}' — {len(finalized):,} records.\n\n{summary}"
 
 
 def explode_models(df: pd.DataFrame) -> pd.DataFrame:
@@ -301,6 +457,10 @@ if "file_dates" not in st.session_state:
     st.session_state.file_dates = {}  # filename -> date
 if "page" not in st.session_state:
     st.session_state.page = "Overview Dashboard"
+if "data_xlsx_dismissed" not in st.session_state:
+    st.session_state.data_xlsx_dismissed = False  # set by "Clear all uploaded files"
+if "data_xlsx_mtime" not in st.session_state:
+    st.session_state.data_xlsx_mtime = None  # disk mtime of the data.xlsx we last (auto-)loaded
 
 FILTER_DEFAULTS = {
     "f_date_range": None,
@@ -319,10 +479,39 @@ def reset_filters():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-load data.xlsx (if present next to app.py) so a shared dashboard URL
+# shows data immediately without anyone having to upload a file first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+if DATA_XLSX_PATH.exists() and not st.session_state.data_xlsx_dismissed:
+    disk_mtime = DATA_XLSX_PATH.stat().st_mtime
+    already_loaded = DATA_XLSX_NAME in st.session_state.raw_frames or DATA_XLSX_NAME in st.session_state.pending_raw
+    stale = st.session_state.data_xlsx_mtime is not None and st.session_state.data_xlsx_mtime != disk_mtime
+
+    if stale:
+        # The admin replaced data.xlsx on disk since we loaded it — drop the
+        # old copy so it gets re-read (and re-mapped) below.
+        st.session_state.raw_frames.pop(DATA_XLSX_NAME, None)
+        st.session_state.pending_raw.pop(DATA_XLSX_NAME, None)
+        st.session_state.column_mappings.pop(DATA_XLSX_NAME, None)
+        st.session_state.file_dates.pop(DATA_XLSX_NAME, None)
+        already_loaded = False
+
+    if not already_loaded:
+        raw_df, err = read_local_data_file(DATA_XLSX_PATH)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.pending_raw[DATA_XLSX_NAME] = raw_df
+        st.session_state.data_xlsx_mtime = disk_mtime
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar — navigation + upload
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    st.caption("ℹ️ Data auto-refreshes when admin uploads a new report.")
     st.title("🤖 Claude Usage")
     st.session_state.page = st.radio(
         "Page", ["Overview Dashboard", "User Detail"], label_visibility="collapsed"
@@ -352,8 +541,7 @@ with st.sidebar:
             for name, mapping in st.session_state.column_mappings.items():
                 st.caption(f"**{name}**")
                 for field, (source_col, method) in mapping.items():
-                    tag = "auto-detected" if method == "auto" else "manually selected"
-                    st.caption(f"&nbsp;&nbsp;• {field} ← '{source_col}' ({tag})")
+                    st.caption(f"&nbsp;&nbsp;• {field} ← {describe_mapping_source(source_col)} ({METHOD_LABELS[method]})")
 
     needs_date_assignment = [
         name
@@ -376,6 +564,10 @@ with st.sidebar:
             st.session_state.pending_raw = {}
             st.session_state.column_mappings = {}
             st.session_state.file_dates = {}
+            # Also stop re-loading data.xlsx for this session — otherwise it would
+            # just reappear on the very next rerun since the file is still on disk.
+            st.session_state.data_xlsx_dismissed = True
+            st.session_state.data_xlsx_mtime = None
             st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,91 +575,97 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.pending_raw:
-    st.title("Claude Usage Dashboard — IT Asset Management")
-    st.subheader("🔗 Map columns")
-    st.caption(
-        "We couldn't match every column by its exact name — confirm the mapping below "
-        "for each file so the dashboard knows which column is which."
-    )
-
+    fields = list(REQUIRED_COLUMNS)
+    auto_ready = []
+    needs_manual = []
     for name in list(st.session_state.pending_raw.keys()):
         raw_df = st.session_state.pending_raw[name]
-        with st.container(border=True):
-            st.markdown(f"**{name}**")
-            st.info(f"Columns found in this file: {', '.join(str(c) for c in raw_df.columns)}")
+        resolved = resolve_column_mapping(list(raw_df.columns))
+        fully_auto = all(resolved[f]["status"] in ("auto", "auto_sum") for f in fields)
+        (auto_ready if fully_auto else needs_manual).append((name, raw_df, resolved))
 
-            auto_map, ambiguous = auto_match_columns(list(raw_df.columns))
-            final_map = {}
-            method = {}
+    # Every column matched cleanly -> skip the manual-mapping UI entirely and
+    # just load the file, with a summary of what was matched to what.
+    for name, raw_df, resolved in auto_ready:
+        final_map = {f: resolved[f]["value"] for f in fields}
+        method = {f: resolved[f]["status"] for f in fields}
+        st.success(commit_file_mapping(name, raw_df, final_map, method, fields))
 
-            unmatched = [field for field, col in auto_map.items() if col is None]
-            if unmatched:
-                st.warning(
-                    "Couldn't automatically match: " + ", ".join(unmatched) +
-                    ". Please select the matching column for each below."
-                )
+    if needs_manual:
+        st.title("Claude Usage Dashboard — IT Asset Management")
+        st.subheader("🔗 Map columns")
+        st.caption(
+            "We couldn't match every column by its exact name — confirm the mapping below "
+            "for each file so the dashboard knows which column is which."
+        )
 
-            col_a, col_b = st.columns(2)
-            fields = list(FIELD_KEYWORDS.keys())
-            for i, field in enumerate(fields):
-                target_col = col_a if i % 2 == 0 else col_b
-                with target_col:
-                    if auto_map[field] is not None:
-                        st.success(f"{field} ← '{auto_map[field]}' (auto-detected)")
-                        final_map[field] = auto_map[field]
-                        method[field] = "auto"
-                    else:
-                        if ambiguous[field]:
-                            st.caption(
-                                f"⚠️ Multiple possible matches for **{field}**: "
-                                + ", ".join(f"'{c}'" for c in ambiguous[field])
-                                + " — pick the right one (or the single combined total, "
-                                "if there is one)."
+        for name, raw_df, resolved in needs_manual:
+            with st.container(border=True):
+                st.markdown(f"**{name}**")
+                st.info(f"Columns found in this file: {', '.join(str(c) for c in raw_df.columns)}")
+
+                unmatched = [f for f in fields if resolved[f]["status"] == "unmatched"]
+                if unmatched:
+                    st.warning(
+                        "Couldn't automatically match: " + ", ".join(unmatched) +
+                        ". Please select the matching column for each below."
+                    )
+
+                final_map = {}
+                method = {}
+                col_a, col_b = st.columns(2)
+                for i, field in enumerate(fields):
+                    target_col = col_a if i % 2 == 0 else col_b
+                    info = resolved[field]
+                    with target_col:
+                        if info["status"] in ("auto", "auto_sum"):
+                            st.success(
+                                f"{field} ← {describe_mapping_source(info['value'])} "
+                                f"({METHOD_LABELS[info['status']]})"
                             )
-                        # Ambiguous candidates are surfaced first so the likely
-                        # options aren't buried in the full column list.
-                        options = ["-- Select column --"] + ambiguous[field] + [
-                            str(c) for c in raw_df.columns if str(c) not in ambiguous[field]
-                        ]
-                        choice = st.selectbox(
-                            f"{field} column",
-                            options,
-                            key=f"colmap_{name}_{field}",
-                        )
-                        final_map[field] = None if choice == "-- Select column --" else choice
-                        method[field] = "manual"
+                            final_map[field] = info["value"]
+                            method[field] = info["status"]
+                        else:
+                            if info["candidates"]:
+                                st.caption(
+                                    f"⚠️ Multiple possible matches for **{field}**: "
+                                    + ", ".join(f"'{c}'" for c in info["candidates"])
+                                    + " — pick the right one (or the single combined total, "
+                                    "if there is one)."
+                                )
+                            # Ambiguous candidates are surfaced first so the likely
+                            # options aren't buried in the full column list.
+                            options = ["-- Select column --"] + info["candidates"] + [
+                                str(c) for c in raw_df.columns if str(c) not in info["candidates"]
+                            ]
+                            choice = st.selectbox(
+                                f"{field} column",
+                                options,
+                                key=f"colmap_{name}_{field}",
+                            )
+                            final_map[field] = None if choice == "-- Select column --" else choice
+                            method[field] = "manual"
 
-            # Guard against two fields being pointed at the same source column.
-            chosen_cols = [c for c in final_map.values() if c]
-            duplicate_cols = {c for c in chosen_cols if chosen_cols.count(c) > 1}
-            all_mapped = all(final_map.values())
+                # Guard against two fields being pointed at the same source column(s).
+                chosen_cols = []
+                for v in final_map.values():
+                    if isinstance(v, (list, tuple)):
+                        chosen_cols.extend(v)
+                    elif v:
+                        chosen_cols.append(v)
+                duplicate_cols = {c for c in chosen_cols if chosen_cols.count(c) > 1}
+                all_mapped = all(final_map.values())
 
-            if duplicate_cols:
-                st.error(
-                    "These column(s) are mapped to more than one field — please pick a "
-                    f"distinct column for each: {', '.join(duplicate_cols)}."
-                )
+                if duplicate_cols:
+                    st.error(
+                        "These column(s) are mapped to more than one field — please pick a "
+                        f"distinct column for each: {', '.join(duplicate_cols)}."
+                    )
 
-            confirm_disabled = not all_mapped or bool(duplicate_cols)
-            if st.button("✅ Confirm mapping & load file", key=f"confirm_{name}", disabled=confirm_disabled):
-                finalized = finalize_mapped_df(raw_df, final_map, name)
-                st.session_state.raw_frames[name] = finalized
-                st.session_state.column_mappings[name] = {
-                    field: (final_map[field], method[field]) for field in fields
-                }
-                del st.session_state.pending_raw[name]
-
-                guessed = guess_date_from_filename(name)
-                if guessed is None and finalized["Date"].notna().any():
-                    guessed = finalized["Date"].dropna().dt.date.min()
-                st.session_state.file_dates[name] = guessed
-
-                summary = "\n".join(
-                    f"- {field} ← '{final_map[field]}' ({'auto-detected' if method[field] == 'auto' else 'manually selected'})"
-                    for field in fields
-                )
-                st.success(f"Loaded '{name}' — {len(finalized):,} records.\n\n{summary}")
-                st.rerun()
+                confirm_disabled = not all_mapped or bool(duplicate_cols)
+                if st.button("✅ Confirm mapping & load file", key=f"confirm_{name}", disabled=confirm_disabled):
+                    st.success(commit_file_mapping(name, raw_df, final_map, method, fields))
+                    st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build combined dataset
@@ -956,6 +1154,10 @@ def render_user_detail(df: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 # Router
 # ─────────────────────────────────────────────────────────────────────────────
+
+if DATA_XLSX_NAME in st.session_state.raw_frames and DATA_XLSX_PATH.exists():
+    last_updated = datetime.fromtimestamp(DATA_XLSX_PATH.stat().st_mtime).strftime("%B %d, %Y at %I:%M %p")
+    st.info(f"📊 Viewing latest report: {DATA_XLSX_NAME} — Last updated: {last_updated}")
 
 if filtered.empty and not (
     isinstance(date_range, tuple) and len(date_range) == 2 and date_range[0] > date_range[1]
