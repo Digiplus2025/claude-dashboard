@@ -78,6 +78,77 @@ st.markdown(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Authentication — gate everything below (data loading, sidebar, charts)
+# behind a password so nothing renders until the correct one is entered.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_APP_PASSWORD = "digiplus2026"
+
+
+def get_app_password() -> str:
+    """st.secrets["APP_PASSWORD"] when configured, else a hardcoded fallback
+    (so the app still runs locally / in a fresh deploy with no secrets set)."""
+    try:
+        return st.secrets["APP_PASSWORD"]
+    except Exception:  # noqa: BLE001 — no secrets.toml, or key not set
+        return DEFAULT_APP_PASSWORD
+
+
+def render_login_screen():
+    st.markdown(
+        """
+        <div style="text-align:center; margin-top:3rem; margin-bottom:1.5rem;">
+            <div style="font-size:2.5rem;">🤖</div>
+            <h1 style="margin-bottom:0;">Claude Usage Dashboard</h1>
+            <p style="color:#898781; margin-top:0.25rem;">IT Asset Management</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, center, _ = st.columns([1, 1.2, 1])
+    with center:
+        with st.container(border=True):
+            st.markdown("##### 🔒 Enter password to continue")
+
+            if st.session_state.login_failed:
+                st.error("Incorrect password. Please try again.")
+                st.session_state.login_failed = False
+
+            # The key changes on every failed attempt so the widget is
+            # recreated empty, which is how a failed login "clears the field".
+            with st.form(f"login_form_{st.session_state.login_attempt}"):
+                password = st.text_input(
+                    "Password",
+                    type="password",
+                    label_visibility="collapsed",
+                    placeholder="Password",
+                    key=f"login_password_{st.session_state.login_attempt}",
+                )
+                submitted = st.form_submit_button("Login", use_container_width=True)
+
+            if submitted:
+                if password == get_app_password():
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.session_state.login_attempt += 1
+                    st.session_state.login_failed = True
+                    st.rerun()
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "login_attempt" not in st.session_state:
+    st.session_state.login_attempt = 0
+if "login_failed" not in st.session_state:
+    st.session_state.login_failed = False
+
+if not st.session_state.authenticated:
+    render_login_screen()
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -295,6 +366,14 @@ if DATA_XLSX_PATH.exists() and not st.session_state.data_xlsx_dismissed:
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    badge_col, logout_col = st.columns([1, 1])
+    with badge_col:
+        st.markdown("🔒 **Secured**")
+    with logout_col:
+        if st.button("Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.rerun()
+
     st.caption("ℹ️ Data auto-refreshes when admin uploads a new report.")
     st.title("🤖 Claude Usage")
     st.session_state.page = st.radio(
